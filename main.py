@@ -89,10 +89,11 @@ def signup(email: str = Form(...)):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Signup failed: {str(e)}")
-
+    
 @app.post("/register")
 async def register_student(
-    enroll_no: str = Form(...),
+    Rollno: str = Form(...),
+    studentName: str = Form(...),   # 👈 new field
     images: List[UploadFile] = None,
     userEmail: str = Header(...)
 ):
@@ -113,28 +114,40 @@ async def register_student(
             if not faces:
                 raise HTTPException(status_code=400, detail=f"No face detected in {img_file.filename}")
 
+            # largest face
             face = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))
             embeddings.append(l2_normalize(face.embedding))
 
         mean_emb = l2_normalize(np.mean(np.stack(embeddings, axis=0), axis=0))
 
-        if enroll_no in labels:
-            idx = labels.index(enroll_no)
+        # Store tuple (roll_no, name) instead of only roll_no
+        student_id = f"{Rollno}:{studentName}"
+
+        if any(lbl.startswith(Rollno + ":") for lbl in labels):
+            # Update existing entry for this roll number
+            idx = next(i for i, lbl in enumerate(labels) if lbl.startswith(Rollno + ":"))
+            labels[idx] = student_id  # update name also
             embeddings_db[idx] = mean_emb
-            msg = f"Updated entry for {enroll_no}"
+            msg = f"Updated entry for {Rollno} ({studentName})"
         else:
-            labels.append(enroll_no)
+            labels.append(student_id)
             embeddings_db = np.vstack([embeddings_db, mean_emb]) if embeddings_db.size else mean_emb[np.newaxis, :]
-            msg = f"Registered new student {enroll_no}"
+            msg = f"Registered new student {Rollno} ({studentName})"
 
         save_database(labels, embeddings_db, db_path)
-        return {"message": msg, "total_students": len(labels)}
+        return {
+            "message": msg,
+            "total_students": len(labels),
+            "student": {"roll_no": Rollno, "name": studentName}
+        }
 
     except HTTPException:
         raise
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Register failed: {str(e)}")
+
+    
 
 @app.post("/recognize")
 async def recognize_classroom(
@@ -154,8 +167,17 @@ async def recognize_classroom(
             img.copy(), faces, labels, embeddings_db, MATCH_THRESHOLD
         )
 
+        # 🔑 Split "roll_no:name" into structured dicts
+        recognized_students = []
+        for rid in rec_ids:
+            if ":" in rid:
+                roll_no, name = rid.split(":", 1)
+                recognized_students.append({"roll_no": roll_no, "name": name})
+            else:
+                recognized_students.append({"roll_no": rid, "name": None})
+
         result = {
-            "recognized_ids": rec_ids,
+            "recognized_students": recognized_students,
             "annotated_all": img_to_base64(all_faces_img),
             "annotated_unrecognized": img_to_base64(unrec_img)
         }
@@ -166,3 +188,33 @@ async def recognize_classroom(
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Recognition failed: {str(e)}")
+
+    
+@app.get("/students")
+def list_students(userEmail: str = Header(...)):
+    try:
+        db_path = get_user_db_path(userEmail)
+        labels, _ = load_database(db_path)
+
+        if not labels:
+            return {"message": f"No students registered for {userEmail}", "students": []}
+
+        students = []
+        for lbl in labels:
+            if ":" in lbl:
+                roll_no, name = lbl.split(":", 1)
+                students.append({"roll_no": roll_no, "name": name})
+            else:
+                students.append({"roll_no": lbl, "name": None})
+
+        return {
+            "message": f"Total {len(students)} students found for {userEmail}",
+            "students": students
+        }
+
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to fetch students: {str(e)}")
+
+
+
