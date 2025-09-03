@@ -72,6 +72,47 @@ def img_to_base64(img):
     _, buf = cv2.imencode(".jpg", img)
     return base64.b64encode(buf).decode()
 
+# Common function used by both routes ie. reco and deReco
+async def process_images(files: List[UploadFile], userEmail: str):
+    db_path = get_user_db_path(userEmail)
+    labels, embeddings_db = load_database(db_path)
+
+    all_recognized = []
+    annotated_all_imgs = []
+    annotated_unrec_imgs = []
+
+    for file in files:
+        img_bytes = await file.read()
+        img_np = np.frombuffer(img_bytes, np.uint8)
+        img = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+
+        faces = app_insight.get(img)
+        rec_ids, all_faces_img, unrec_img = annotate_faces(
+            img.copy(), faces, labels, embeddings_db, MATCH_THRESHOLD
+        )
+
+        # Collect recognized students
+        for rid in rec_ids:
+            if ":" in rid:
+                roll_no, name = rid.split(":", 1)
+                all_recognized.append({"roll_no": roll_no, "name": name})
+            else:
+                all_recognized.append({"roll_no": rid, "name": None})
+
+        # Save annotated images for merging
+        annotated_all_imgs.append(all_faces_img)
+        annotated_unrec_imgs.append(unrec_img)
+
+    # Deduplicate recognized students by (roll_no, name)
+    unique_students = {
+        (student["roll_no"], student["name"]): student
+        for student in all_recognized
+    }
+    recognized_students = list(unique_students.values())
+
+    return recognized_students, annotated_all_imgs, annotated_unrec_imgs
+
+
 # -------------------- ROUTES --------------------
 
 @app.get("/")
@@ -151,35 +192,14 @@ async def register_student(
 
 @app.post("/recognize")
 async def recognize_classroom(
-    file: UploadFile = File(...),
+    files: List[UploadFile] = File(...),
     userEmail: str = Header(...)
 ):
     try:
-        db_path = get_user_db_path(userEmail)
-        labels, embeddings_db = load_database(db_path)
-
-        img_bytes = await file.read()
-        img_np = np.frombuffer(img_bytes, np.uint8)
-        img = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
-
-        faces = app_insight.get(img)
-        rec_ids, all_faces_img, unrec_img = annotate_faces(
-            img.copy(), faces, labels, embeddings_db, MATCH_THRESHOLD
-        )
-
-        # 🔑 Split "roll_no:name" into structured dicts
-        recognized_students = []
-        for rid in rec_ids:
-            if ":" in rid:
-                roll_no, name = rid.split(":", 1)
-                recognized_students.append({"roll_no": roll_no, "name": name})
-            else:
-                recognized_students.append({"roll_no": rid, "name": None})
+        recognized_students, _, _ = await process_images(files, userEmail)
 
         result = {
-            "recognized_students": recognized_students,
-            "annotated_all": img_to_base64(all_faces_img),
-            "annotated_unrecognized": img_to_base64(unrec_img)
+            "recognized_students": recognized_students
         }
         return JSONResponse(result)
 
@@ -188,6 +208,44 @@ async def recognize_classroom(
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Recognition failed: {str(e)}")
+
+
+# 📌 Debug recognition route (returns annotated images too)
+@app.post("/debugRecognize")
+async def debug_recognize_classroom(
+    files: List[UploadFile] = File(...),
+    userEmail: str = Header(...)
+):
+    try:
+        recognized_students, annotated_all_imgs, annotated_unrec_imgs = await process_images(files, userEmail)
+
+        # Merge annotated images into contact sheets
+        def merge_images(img_list):
+            if not img_list:
+                return None
+            heights = [img.shape[0] for img in img_list]
+            target_h = min(heights)
+            resized = [
+                cv2.resize(img, (int(img.shape[1] * target_h / img.shape[0]), target_h))
+                for img in img_list
+            ]
+            return cv2.hconcat(resized)
+
+        merged_all = merge_images(annotated_all_imgs)
+        merged_unrec = merge_images(annotated_unrec_imgs)
+
+        result = {
+            "recognized_students": recognized_students,
+            "annotated_all": img_to_base64(merged_all) if merged_all is not None else None,
+            "annotated_unrecognized": img_to_base64(merged_unrec) if merged_unrec is not None else None
+        }
+        return JSONResponse(result)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Debug recognition failed: {str(e)}")
 
     
 @app.get("/students")
