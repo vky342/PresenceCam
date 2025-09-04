@@ -134,16 +134,17 @@ def signup(email: str = Form(...)):
 @app.post("/register")
 async def register_student(
     Rollno: str = Form(...),
-    studentName: str = Form(...),   # 👈 new field
-    images: List[UploadFile] = None,
+    studentName: str = Form(...),
+    images: List[UploadFile] = File(...),   # required; client can send 1..3 files
     userEmail: str = Header(...)
 ):
     try:
+        # validate number of files: at least 1, at most 3
+        if not images or len(images) < 1 or len(images) > 3:
+            raise HTTPException(status_code=400, detail="Please upload between 1 and 3 images.")
+
         db_path = get_user_db_path(userEmail)
         labels, embeddings_db = load_database(db_path)
-
-        if not images or len(images) != 3:
-            raise HTTPException(status_code=400, detail="Please upload exactly 3 images.")
 
         embeddings = []
         for img_file in images:
@@ -155,19 +156,20 @@ async def register_student(
             if not faces:
                 raise HTTPException(status_code=400, detail=f"No face detected in {img_file.filename}")
 
-            # largest face
+            # choose the largest face
             face = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))
             embeddings.append(l2_normalize(face.embedding))
 
+        # mean of available embeddings (works for 1..3 images)
         mean_emb = l2_normalize(np.mean(np.stack(embeddings, axis=0), axis=0))
 
-        # Store tuple (roll_no, name) instead of only roll_no
+        # Store tuple (roll_no, name) as label
         student_id = f"{Rollno}:{studentName}"
 
         if any(lbl.startswith(Rollno + ":") for lbl in labels):
-            # Update existing entry for this roll number
+            # Update existing entry for this roll number (also update name)
             idx = next(i for i, lbl in enumerate(labels) if lbl.startswith(Rollno + ":"))
-            labels[idx] = student_id  # update name also
+            labels[idx] = student_id
             embeddings_db[idx] = mean_emb
             msg = f"Updated entry for {Rollno} ({studentName})"
         else:
