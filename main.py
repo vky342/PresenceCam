@@ -275,6 +275,45 @@ def list_students(userEmail: str = Header(...)):
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Failed to fetch students: {str(e)}")
+    
+
+
+@app.delete("/deleteStudent")
+def delete_student(
+    Rollno: str = Form(...),
+    studentName: str = Form(...),
+    userEmail: str = Header(...)
+):
+    try:
+        db_path = get_user_db_path(userEmail)
+        labels, embeddings_db = load_database(db_path)
+
+        target_label = f"{Rollno}:{studentName}"
+
+        # find all indices that exactly match the target label
+        indices = [i for i, lbl in enumerate(labels) if lbl == target_label]
+        if not indices:
+            raise HTTPException(status_code=404, detail=f"Student {target_label} not found for {userEmail}.")
+
+        # Remove labels at indices (do it in reverse to avoid reindexing issues)
+        for idx in sorted(indices, reverse=True):
+            labels.pop(idx)
+            if embeddings_db.size:
+                embeddings_db = np.delete(embeddings_db, idx, axis=0)
+
+        save_database(labels, embeddings_db, db_path)
+
+        return {
+            "message": f"Deleted {len(indices)} record(s) for {target_label}",
+            "total_students": len(labels)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Deletion failed: {str(e)}")
+
 
 
 
