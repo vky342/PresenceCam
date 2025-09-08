@@ -5,6 +5,9 @@ import numpy as np
 import os, cv2, base64
 from insightface.app import FaceAnalysis
 import traceback
+from PIL import Image
+import pillow_heif  # ensures HEIC support
+
 
 
 app = FastAPI()
@@ -73,7 +76,16 @@ def img_to_base64(img):
     return base64.b64encode(buf).decode()
 
 # Common function used by both routes ie. reco and deReco
+
 async def process_images(files: List[UploadFile], userEmail: str):
+    """
+    Process uploaded files and return:
+      - recognized_students: List[dict]
+      - annotated_all_imgs: List[np.ndarray]
+      - annotated_unrec_imgs: List[np.ndarray]
+    Handles JPEG/PNG via OpenCV, and falls back to HEIC via pillow_heif+Pillow.
+    Skips invalid/unreadable files and raises 400 if none valid.
+    """
     db_path = get_user_db_path(userEmail)
     labels, embeddings_db = load_database(db_path)
 
@@ -81,27 +93,87 @@ async def process_images(files: List[UploadFile], userEmail: str):
     annotated_all_imgs = []
     annotated_unrec_imgs = []
 
+    any_valid = False
+    invalid_files = []
+
     for file in files:
-        img_bytes = await file.read()
-        img_np = np.frombuffer(img_bytes, np.uint8)
-        img = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+        filename = getattr(file, "filename", "<unknown>")
+        try:
+            img_bytes = await file.read()
+            if not img_bytes:
+                invalid_files.append(filename)
+                continue
 
-        faces = app_insight.get(img)
-        rec_ids, all_faces_img, unrec_img = annotate_faces(
-            img.copy(), faces, labels, embeddings_db, MATCH_THRESHOLD
-        )
+            # Try OpenCV first (fast; supports jpg/png)
+            img_np = np.frombuffer(img_bytes, np.uint8)
+            img = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
 
-        # Collect recognized students
-        for rid in rec_ids:
-            if ":" in rid:
-                roll_no, name = rid.split(":", 1)
-                all_recognized.append({"roll_no": roll_no, "name": name})
-            else:
-                all_recognized.append({"roll_no": rid, "name": None})
+            # If OpenCV failed (e.g. HEIC), try pillow_heif -> PIL -> OpenCV
+            if img is None:
+                try:
+                    heif_file = pillow_heif.read_heif(img_bytes)
+                    # Create a PIL Image from the heif data
+                    pil_img = Image.frombytes(
+                        heif_file.mode,
+                        heif_file.size,
+                        heif_file.data,
+                        "raw",
+                        heif_file.mode,
+                        heif_file.stride,
+                    )
+                    # Convert PIL to OpenCV BGR
+                    img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+                except Exception:
+                    # Last-ditch: try Pillow to open common formats (some streams)
+                    try:
+                        pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                        img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+                    except Exception:
+                        img = None
 
-        # Save annotated images for merging
-        annotated_all_imgs.append(all_faces_img)
-        annotated_unrec_imgs.append(unrec_img)
+            if img is None:
+                invalid_files.append(filename)
+                continue
+
+            any_valid = True
+
+            # Run face detection & recognition on the decoded image
+            try:
+                faces = app_insight.get(img)
+            except Exception:
+                # Detector failed for this image; log and skip this file
+                traceback.print_exc()
+                invalid_files.append(filename)
+                continue
+
+            rec_ids, all_faces_img, unrec_img = annotate_faces(
+                img.copy(), faces, labels, embeddings_db, MATCH_THRESHOLD
+            )
+
+            # Collect recognized students
+            for rid in rec_ids:
+                if ":" in rid:
+                    roll_no, name = rid.split(":", 1)
+                    all_recognized.append({"roll_no": roll_no, "name": name})
+                else:
+                    all_recognized.append({"roll_no": rid, "name": None})
+
+            # Save annotated images for merging (only add if returned)
+            if all_faces_img is not None:
+                annotated_all_imgs.append(all_faces_img)
+            if unrec_img is not None:
+                annotated_unrec_imgs.append(unrec_img)
+
+        except Exception:
+            traceback.print_exc()
+            invalid_files.append(filename)
+            continue
+
+    if not any_valid:
+        detail = "No valid images received"
+        if invalid_files:
+            detail += f"; invalid files: {', '.join(invalid_files[:10])}"
+        raise HTTPException(status_code=400, detail=detail)
 
     # Deduplicate recognized students by (roll_no, name)
     unique_students = {
