@@ -14,7 +14,7 @@ app = FastAPI()
 
 # -------------------- CONFIG --------------------
 DET_SIZE = 320
-DET_SIZE_RECO = 1536
+DET_SIZE_RECO = 1280
 MATCH_THRESHOLD = 0.4
 BASE_DB_DIR = "user_dbs"  # each user will have their own DB folder
 
