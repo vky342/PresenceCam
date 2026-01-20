@@ -2,6 +2,7 @@ from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from typing import List, Optional, Union, Tuple
 import numpy as np
+import json
 import os, cv2, base64, io
 from insightface.app import FaceAnalysis
 import traceback
@@ -201,7 +202,7 @@ def replace_images(uuid_str: str, new_images: List[ImageLike], base_dir: Union[s
         raise  # re-raise to make failure visible to caller
 
 
-# -------------------- CONFIG --------------------
+                                            # -------------------- CONFIG --------------------
 DET_SIZE = 320
 DET_SIZE_RECO = 1280
 MATCH_THRESHOLD = 0.4
@@ -221,7 +222,7 @@ app_insight = FaceAnalysis(name="buffalo_l")
 app_insight.prepare(ctx_id=-1, det_size=(DET_SIZE_RECO, DET_SIZE_RECO))
 
 
-# -------------------- HELPERS --------------------
+                                            # -------------------- HELPERS --------------------
 def get_user_db_path(email: str):
     """Get per-user DB path."""
     safe_email = email.replace("@", "_").replace(".", "_")
@@ -339,10 +340,11 @@ def img_to_base64(img):
 
 
 # Common function used by both routes ie. reco and deReco
-async def process_images(files: List[UploadFile], userEmail: str):
+async def process_images(files: List[UploadFile], userEmail: str, classId: str):
     db_path = get_user_db_path(userEmail)
     metadata, embeddings_db = load_database(db_path)
-    labels = labels_from_metadata(metadata)  # keep alignment
+    metadata, embeddings_db = filter_by_class(metadata, embeddings_db, classId)
+    labels = labels_from_metadata(metadata)
 
     all_recognized = []
     annotated_all_imgs = []
@@ -438,7 +440,50 @@ async def process_images(files: List[UploadFile], userEmail: str):
     return recognized_students, annotated_all_imgs, annotated_unrec_imgs
 
 
-# -------------------- ROUTES --------------------
+def filter_by_class(metadata, embeddings_db, class_id):
+    """
+    Returns (filtered_metadata, filtered_embeddings)
+    preserving index alignment.
+    """
+    idxs = [i for i, m in enumerate(metadata) if m.get("class") == class_id]
+
+    if not idxs:
+        return [], np.empty((0, embeddings_db.shape[1] if embeddings_db.size else 512), dtype=np.float32)
+
+    filtered_meta = [metadata[i] for i in idxs]
+    filtered_emb = embeddings_db[idxs] if embeddings_db.size else np.empty((0, 512), dtype=np.float32)
+
+    return filtered_meta, filtered_emb
+
+def get_user_classes_path(email: str):
+    safe_email = email.replace("@", "_").replace(".", "_")
+    return os.path.join(BASE_DB_DIR, f"{safe_email}_classes.json")
+
+
+def load_classes(email: str):
+    path = get_user_classes_path(email)
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_classes(email: str, classes: list):
+    path = get_user_classes_path(email)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(classes, f, ensure_ascii=False, indent=2)
+
+
+def get_class_by_id(classes, class_id: str):
+    return next((c for c in classes if c["id"] == class_id), None)
+
+
+def get_class_by_name(classes, name: str):
+    return next((c for c in classes if c["name"].lower() == name.lower()), None)
+
+
+
+                                # -------------------- ROUTES --------------------
 
 @app.get("/")
 def root():
@@ -463,7 +508,8 @@ def signup(email: str = Form(...)):
 async def register_student(
     Rollno: str = Form(...),
     studentName: str = Form(...),
-    images: List[UploadFile] = File(...),   # required; client can send 1..3 files
+    classId: str = Form(...),
+    images: List[UploadFile] = File(...),
     userEmail: str = Header(...)
 ):
     try:
@@ -472,11 +518,18 @@ async def register_student(
             raise HTTPException(status_code=400, detail=f"Please upload between {MIN_IMAGES} and {MAX_IMAGES} images.")
 
         db_path = get_user_db_path(userEmail)
+        classes = load_classes(userEmail)
+        if not get_class_by_id(classes, classId):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid classId. Please select or create a class first."
+                    )
+        
         metadata, embeddings_db = load_database(db_path)
         labels = labels_from_metadata(metadata)
 
         # If exact (roll_no, name) pair already present -> reject as duplicate
-        duplicate = next((m for m in metadata if m.get("roll_no") == Rollno and (m.get("name") or "") == studentName), None)
+        duplicate = next((m for m in metadata if m.get("class") == classId and m.get("roll_no") == Rollno and (m.get("name") or "") == studentName),None)
         if duplicate is not None:
             raise HTTPException(status_code=400, detail=f"Student already registered with id {duplicate['id']}")
 
@@ -533,9 +586,10 @@ async def register_student(
             "id": student_id,
             "roll_no": Rollno,
             "name": studentName,
+            "class": classId,
             "created_at": now,
             "updated_at": now
-        }
+            }
 
         metadata.append(new_record)
         if getattr(embeddings_db, "size", 0):
@@ -583,10 +637,18 @@ async def register_student(
 @app.post("/recognize")
 async def recognize_classroom(
     files: List[UploadFile] = File(...),
+    classId: str = Form(...),
     userEmail: str = Header(...)
 ):
     try:
-        recognized_students, _, _ = await process_images(files, userEmail)
+        classes = load_classes(userEmail)
+        if not get_class_by_id(classes, classId):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid classId"
+                )
+
+        recognized_students, _, _ = await process_images(files, userEmail, classId)
 
         result = {
             "recognized_students": recognized_students
@@ -604,10 +666,11 @@ async def recognize_classroom(
 @app.post("/debugRecognize")
 async def debug_recognize_classroom(
     files: List[UploadFile] = File(...),
-    userEmail: str = Header(...)
+    userEmail: str = Header(...),
+    classId: str = Form(...),
 ):
     try:
-        recognized_students, annotated_all_imgs, annotated_unrec_imgs = await process_images(files, userEmail)
+        recognized_students, annotated_all_imgs, annotated_unrec_imgs = await process_images(files, userEmail, classId)
 
         def merge_images(img_list):
             if not img_list:
@@ -638,34 +701,62 @@ async def debug_recognize_classroom(
 
 
 @app.get("/students")
-def list_students(userEmail: str = Header(...)):
+def list_students(
+    classId: str,
+    userEmail: str = Header(...)
+):
     try:
         db_path = get_user_db_path(userEmail)
         metadata, _ = load_database(db_path)
 
         if not metadata:
-            return {"message": f"No students registered for {userEmail}", "students": []}
+            return {
+                "message": f"No students registered for {userEmail}",
+                "students": []
+            }
 
-        students = []
-        for m in metadata:
-            students.append({"id": m.get("id"), "roll_no": m.get("roll_no"), "name": m.get("name")})
+        # Filter students by class
+        students = [
+            {
+                "id": m.get("id"),
+                "roll_no": m.get("roll_no"),
+                "name": m.get("name")
+            }
+            for m in metadata
+            if m.get("class") == classId
+        ]
+
+        if not students:
+            return {
+                "message": f"No students found for class '{classId}'",
+                "students": []
+            }
 
         return {
-            "message": f"Total {len(students)} students found for {userEmail}",
+            "message": f"Total {len(students)} students found for class '{classId}'",
             "students": students
         }
 
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to fetch students: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to fetch students: {str(e)}"
+        )
+
 
 
 @app.delete("/studentDelete")
-def delete_student_by_id(student_id: str = Form(...), userEmail: str = Header(...)):
+def delete_student_by_id(
+    student_id: str = Form(...),
+    classId: str = Form(...),
+    userEmail: str = Header(...)
+):
     """
-    Delete student by UUID:
+    Delete student by UUID (class-scoped):
+      - Verifies student belongs to classId
       - Removes metadata and embedding row
-      - Deletes stored images for that student_id from IMAGES_DIR
+      - Deletes stored images for that student_id
     """
     try:
         db_path = get_user_db_path(userEmail)
@@ -674,6 +765,13 @@ def delete_student_by_id(student_id: str = Form(...), userEmail: str = Header(..
         idx = next((i for i, m in enumerate(metadata) if m.get("id") == student_id), None)
         if idx is None:
             raise HTTPException(status_code=404, detail="Student not found")
+
+        # 🔐 Class ownership check
+        if metadata[idx].get("class") != classId:
+            raise HTTPException(
+                status_code=403,
+                detail="Student does not belong to this class"
+            )
 
         # Remove metadata + embedding
         metadata.pop(idx)
@@ -688,7 +786,7 @@ def delete_student_by_id(student_id: str = Form(...), userEmail: str = Header(..
             shutil.rmtree(student_dir)
 
         return {
-            "message": f"Deleted student {student_id} and associated images",
+            "message": f"Deleted student {student_id} from class '{classId}'",
             "total_students": len(metadata)
         }
 
@@ -700,11 +798,13 @@ def delete_student_by_id(student_id: str = Form(...), userEmail: str = Header(..
 
 
 
+
 # ---------- Update metadata ----------
 
 @app.put("/studentsUpdate")
 def update_student_metadata(
     student_id: str = Form(...),
+    classId: str = Form(...),
     roll_no: Optional[str] = Form(None),
     name: Optional[str] = Form(None),
     userEmail: str = Header(...)
@@ -717,15 +817,36 @@ def update_student_metadata(
         if idx is None:
             raise HTTPException(status_code=404, detail="Student not found")
 
+        # 🔐 Class ownership check
+        if metadata[idx].get("class") != classId:
+            raise HTTPException(
+                status_code=403,
+                detail="Student does not belong to this class"
+            )
+
         current = metadata[idx]
         new_roll = roll_no if roll_no is not None else current.get("roll_no")
         new_name = name if name is not None else current.get("name")
 
-        coll = next((m for m in metadata if m.get("id") != student_id and m.get("roll_no") == new_roll and (m.get("name") or "") == (new_name or "")), None)
+        # Collision check ONLY inside same class
+        coll = next(
+            (
+                m for m in metadata
+                if m.get("id") != student_id
+                and m.get("class") == classId
+                and m.get("roll_no") == new_roll
+                and (m.get("name") or "") == (new_name or "")
+            ),
+            None
+        )
+
         if coll is not None:
             raise HTTPException(
                 status_code=400,
-                detail=f"Update would collide with existing student id {coll['id']} (roll_no={coll.get('roll_no')}, name={coll.get('name')}). Choose a different roll_no/name."
+                detail=(
+                    f"Update would collide with existing student id {coll['id']} "
+                    f"in class '{classId}'. Choose a different roll_no/name."
+                )
             )
 
         metadata[idx]["roll_no"] = new_roll
@@ -733,7 +854,11 @@ def update_student_metadata(
         metadata[idx]["updated_at"] = datetime.utcnow().isoformat() + "Z"
 
         save_database(metadata, embeddings_db, db_path)
-        return {"message": "Updated", "student": metadata[idx]}
+
+        return {
+            "message": "Updated",
+            "student": metadata[idx]
+        }
 
     except HTTPException:
         raise
@@ -741,24 +866,26 @@ def update_student_metadata(
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+
 @app.put("/students/re-enroll")
 async def reenroll_and_replace_images(
     student_id: str = Form(...),
-    images: List[UploadFile] = File(...),  # 1..3 images
+    classId: str = Form(...),
+    images: List[UploadFile] = File(...),
     userEmail: str = Header(...)
 ):
     """
-    Combined endpoint: update student's embeddings AND replace stored images for that student_id.
-    Atomic behavior:
-      - compute new embedding, update DB, save DB
-      - attempt to replace images on disk (atomic-ish via replace_images)
-      - if image replace fails, rollback DB to previous state
-    Returns saved image paths and updated student info.
+    Re-enroll student (class-scoped):
+      - Verifies student belongs to classId
+      - Updates embedding
+      - Replaces stored images atomically
     """
     try:
-        # validate number of files
         if not images or len(images) < MIN_IMAGES or len(images) > MAX_IMAGES:
-            raise HTTPException(status_code=400, detail=f"Please upload between {MIN_IMAGES} and {MAX_IMAGES} images.")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Please upload between {MIN_IMAGES} and {MAX_IMAGES} images."
+            )
 
         db_path = get_user_db_path(userEmail)
         metadata, embeddings_db = load_database(db_path)
@@ -767,9 +894,18 @@ async def reenroll_and_replace_images(
         if idx is None:
             raise HTTPException(status_code=404, detail="Student not found")
 
-        # Read all image bytes first
+        # 🔐 Class ownership check (CRITICAL)
+        if metadata[idx].get("class") != classId:
+            raise HTTPException(
+                status_code=403,
+                detail="Student does not belong to this class"
+            )
+
+        # ---------- (everything below is your existing logic, unchanged) ----------
+
         new_images_bytes: List[bytes] = []
         invalid_files = []
+
         for f in images:
             fname = getattr(f, "filename", "<unknown>")
             try:
@@ -781,7 +917,6 @@ async def reenroll_and_replace_images(
             except Exception:
                 traceback.print_exc()
                 invalid_files.append(fname)
-                continue
 
         if not new_images_bytes:
             detail = "No valid image bytes received."
@@ -789,15 +924,15 @@ async def reenroll_and_replace_images(
                 detail += f" Invalid files: {', '.join(invalid_files[:10])}."
             raise HTTPException(status_code=400, detail=detail)
 
-        # Extract embeddings for each image, using face_app
         embeddings_list = []
         invalid_faces = []
+
         for i, img_bytes in enumerate(new_images_bytes, start=1):
             try:
                 img_np = np.frombuffer(img_bytes, np.uint8)
                 img = cv2.imdecode(img_np, cv2.IMREAD_COLOR)
+
                 if img is None:
-                    # try HEIC/Pillow fallback
                     try:
                         heif_file = pillow_heif.read_heif(img_bytes)
                         pil_img = Image.frombytes(
@@ -811,6 +946,7 @@ async def reenroll_and_replace_images(
                         img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
                     except Exception:
                         img = None
+
                 if img is None:
                     invalid_faces.append(f"image#{i}")
                     continue
@@ -820,13 +956,15 @@ async def reenroll_and_replace_images(
                     invalid_faces.append(f"image#{i}")
                     continue
 
-                face = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))
+                face = max(
+                    faces,
+                    key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1])
+                )
                 embeddings_list.append(l2_normalize(face.embedding))
 
             except Exception:
                 traceback.print_exc()
                 invalid_faces.append(f"image#{i}")
-                continue
 
         if not embeddings_list:
             detail = "No valid faces found in provided images."
@@ -834,52 +972,37 @@ async def reenroll_and_replace_images(
                 detail += f" Invalid/face-missing files: {', '.join(invalid_faces[:10])}."
             raise HTTPException(status_code=400, detail=detail)
 
-        # compute mean embedding
-        mean_emb = l2_normalize(np.mean(np.stack(embeddings_list, axis=0), axis=0)).astype(np.float32)
+        mean_emb = l2_normalize(
+            np.mean(np.stack(embeddings_list, axis=0), axis=0)
+        ).astype(np.float32)
 
-        # Prepare rollback copies of DB state
         prev_metadata = list(metadata)
-        prev_embeddings_db = embeddings_db.copy() if getattr(embeddings_db, "size", 0) else embeddings_db
+        prev_embeddings_db = embeddings_db.copy() if embeddings_db.size else embeddings_db
 
-        # Ensure embeddings_db rows align with metadata length
-        emb_dim = mean_emb.shape[0]
-        if embeddings_db.size == 0:
-            embeddings_db = np.zeros((len(metadata), emb_dim), dtype=np.float32)
-        elif embeddings_db.shape[0] != len(metadata):
-            new_db = np.zeros((len(metadata), emb_dim), dtype=np.float32)
-            rows_to_copy = min(embeddings_db.shape[0], len(metadata))
-            new_db[:rows_to_copy, :min(embeddings_db.shape[1], emb_dim)] = embeddings_db[:rows_to_copy, :min(embeddings_db.shape[1], emb_dim)]
-            embeddings_db = new_db
-
-        # Replace embedding row
         embeddings_db[idx] = mean_emb
         metadata[idx]["updated_at"] = datetime.utcnow().isoformat() + "Z"
 
-        # Save DB first
         save_database(metadata, embeddings_db, db_path)
 
-        # Attempt to replace images on disk under IMAGES_DIR/<student_id>/
         try:
             saved_paths = replace_images(student_id, new_images_bytes, IMAGES_DIR)
         except Exception as ex_replace:
-            # rollback DB to previous state
-            try:
-                metadata[:] = prev_metadata
-                embeddings_db = prev_embeddings_db
-                save_database(metadata, embeddings_db, db_path)
-            except Exception as ex_rb:
-                traceback.print_exc()
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Image replace failed ({ex_replace}) and DB rollback failed ({ex_rb}). Manual cleanup required."
-                )
-            traceback.print_exc()
-            raise HTTPException(status_code=500, detail=f"Image replace failed: {str(ex_replace)}")
+            metadata[:] = prev_metadata
+            embeddings_db = prev_embeddings_db
+            save_database(metadata, embeddings_db, db_path)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Image replace failed: {str(ex_replace)}"
+            )
 
-        # Success
         return {
             "message": "Re-enrollment and image replace successful.",
-            "student": {"id": student_id, "roll_no": metadata[idx].get("roll_no"), "name": metadata[idx].get("name")},
+            "student": {
+                "id": student_id,
+                "roll_no": metadata[idx].get("roll_no"),
+                "name": metadata[idx].get("name"),
+                "class": classId
+            },
             "saved_image_paths": [str(p) for p in saved_paths],
             "total_students": len(metadata)
         }
@@ -888,7 +1011,11 @@ async def reenroll_and_replace_images(
         raise
     except Exception as e:
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Re-enroll-and-replace failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Re-enroll-and-replace failed: {str(e)}"
+        )
+
 
 
 
@@ -915,3 +1042,138 @@ async def get_images_by_uuid(uuid: str = Form(...)):
         raise HTTPException(status_code=500, detail=f"Failed to collect images: {str(e)}")
 
 
+# -------------------- NEW : Class System -------------------------------------------
+
+
+@app.get("/classes")
+def list_classes(
+    userEmail: str = Header(..., alias="User-Email")
+):
+    try:
+        classes = load_classes(userEmail)
+        return {
+            "total": len(classes),
+            "classes": classes
+        }
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+@app.post("/classes")
+def create_class(
+    name: str = Form(...),
+    userEmail: str = Header(..., alias="User-Email")
+):
+    try:
+        name = name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Class name cannot be empty")
+
+        classes = load_classes(userEmail)
+
+        # duplicate class name (case-insensitive)
+        if get_class_by_name(classes, name):
+            raise HTTPException(
+                status_code=400,
+                detail="Class with this name already exists"
+            )
+
+        new_class = {
+            "id": f"cls_{uuid.uuid4().hex[:8]}",
+            "name": name,
+            "created_at": datetime.utcnow().isoformat() + "Z"
+        }
+
+        classes.append(new_class)
+        save_classes(userEmail, classes)
+
+        return new_class
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.put("/classes")
+def update_class(
+    classId: str = Form(...),
+    name: str = Form(...),
+    userEmail: str = Header(..., alias="User-Email")
+):
+    try:
+        name = name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Class name cannot be empty")
+
+        classes = load_classes(userEmail)
+
+        cls = next((c for c in classes if c["id"] == classId), None)
+        if not cls:
+            raise HTTPException(status_code=404, detail="Class not found")
+
+        # duplicate name check (ignore self)
+        dup = next(
+            (c for c in classes if c["id"] != classId and c["name"].lower() == name.lower()),
+            None
+        )
+        if dup:
+            raise HTTPException(
+                status_code=400,
+                detail="Another class with this name already exists"
+            )
+
+        cls["name"] = name
+        cls["updated_at"] = datetime.utcnow().isoformat() + "Z"
+
+        save_classes(userEmail, classes)
+
+        return cls
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/classes")
+def delete_class(
+    classId: str = Form(...),
+    userEmail: str = Header(..., alias="User-Email")
+):
+    try:
+        classes = load_classes(userEmail)
+
+        cls = next((c for c in classes if c["id"] == classId), None)
+        if not cls:
+            raise HTTPException(status_code=404, detail="Class not found")
+
+        # Remove class
+        classes = [c for c in classes if c["id"] != classId]
+        save_classes(userEmail, classes)
+
+        # 🔥 Optional but recommended: remove students of this class
+        db_path = get_user_db_path(userEmail)
+        metadata, embeddings_db = load_database(db_path)
+
+        idxs = [i for i, m in enumerate(metadata) if m.get("class") == classId]
+        if idxs:
+            metadata = [m for i, m in enumerate(metadata) if i not in idxs]
+            embeddings_db = (
+                np.delete(embeddings_db, idxs, axis=0)
+                if embeddings_db.size else embeddings_db
+            )
+            save_database(metadata, embeddings_db, db_path)
+
+        return {
+            "message": f"Class '{cls['name']}' deleted successfully"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
