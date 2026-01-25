@@ -203,8 +203,8 @@ def replace_images(uuid_str: str, new_images: List[ImageLike], base_dir: Union[s
 
 
                                             # -------------------- CONFIG --------------------
-DET_SIZE = 320
-DET_SIZE_RECO = 1280
+DET_SIZE = 640
+DET_SIZE_RECO = 640
 MATCH_THRESHOLD = 0.4
 BASE_DB_DIR = "user_dbs"  # each user will have their own DB folder
 IMAGES_DIR = Path("stored_images")  # root for images; you can change this
@@ -319,6 +319,7 @@ def annotate_faces(img, faces, labels, embeddings_db, threshold):
     for face in faces:
         emb = l2_normalize(face.embedding)
         name, score = match_face(emb, embeddings_db, labels, threshold)
+        print("name : ", name, " score : ", score)
         x1, y1, x2, y2 = face.bbox.astype(int)
         cv2.rectangle(img, (x1, y1), (x2, y2), (0,255,0), 2)
         cv2.putText(img, f"{name} ({score:.2f})", (x1, y1-10),
@@ -391,6 +392,7 @@ async def process_images(files: List[UploadFile], userEmail: str, classId: str):
 
             try:
                 faces = app_insight.get(img)
+
             except Exception:
                 traceback.print_exc()
                 invalid_files.append(filename)
@@ -641,6 +643,7 @@ async def recognize_classroom(
     userEmail: str = Header(...)
 ):
     try:
+
         classes = load_classes(userEmail)
         if not get_class_by_id(classes, classId):
             raise HTTPException(
