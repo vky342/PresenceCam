@@ -23,18 +23,31 @@ The design avoids premature microservices and can be modularized later if scale 
 ## 🏗 High-Level Architecture
 
 Android App (Jetpack Compose)
+
 |
+
 | REST APIs
+
 v
+
 FastAPI Backend (Monolith)
+
 |
+
 |-- Image Decoding & Preprocessing
+
 |-- Face Detection & Embedding (InsightFace)
+
 |-- Similarity Matching
+
 |
+
 File-Based Persistence
+
 ├── user_dbs/ → Face embeddings + metadata (.npz)
+
 ├── stored_images/ → Student profile images
+
 └── *_classes.json → Class metadata
 
 
